@@ -45,17 +45,23 @@ jobs:
           tar xzf jmeter.tgz
           echo "$PWD/apache-jmeter-${VERSION}/bin" >> "$GITHUB_PATH"
 
+      # Pinned tarball rather than the apt repo: the k6 apt instructions need a
+      # keyserver fetch that has no dirmngr on the hosted runner, and a pinned
+      # binary keeps the engine version part of the committed config anyway --
+      # an unpinned load generator is its own source of divergence.
       - name: Install k6
         run: |
           set -euo pipefail
-          sudo gpg --no-default-keyring \
-            --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
-            --keyserver hkp://keyserver.ubuntu.com:80 \
-            --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
-          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" \
-            | sudo tee /etc/apt/sources.list.d/k6.list
-          sudo apt-get update -qq
-          sudo apt-get install -y k6
+          VERSION=2.2.0
+          curl -fsSL -o k6.tar.gz \
+            "https://github.com/grafana/k6/releases/download/v${VERSION}/k6-v${VERSION}-linux-amd64.tar.gz"
+          tar xzf k6.tar.gz
+          echo "$PWD/k6-v${VERSION}-linux-amd64" >> "$GITHUB_PATH"
+
+      - name: Show engine versions
+        run: |
+          jmeter --version 2>&1 | tail -3
+          k6 version
 
       - name: Start hermetic stack
         run: make up
