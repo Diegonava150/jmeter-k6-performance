@@ -1,0 +1,93 @@
+name: cross-engine load
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Performance regressions arrive without a commit to blame, so the suite
+    # also runs on its own once a week.
+    - cron: "0 6 * * 1"
+
+jobs:
+  cross-engine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Both verdicts depend on the summarizer being engine-blind, and the build
+      # depends on the gate actually rejecting bad runs. Both are checked before
+      # a single request is sent, because if either is broken then everything
+      # measured afterwards is decoration.
+      - name: Test the summarizer and the gate
+        run: make test
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install JMeter
+        run: |
+          set -euo pipefail
+          VERSION=5.6.3
+          curl -fsSL -o jmeter.tgz \
+            "https://archive.apache.org/dist/jmeter/binaries/apache-jmeter-${VERSION}.tgz"
+          tar xzf jmeter.tgz
+          echo "$PWD/apache-jmeter-${VERSION}/bin" >> "$GITHUB_PATH"
+
+      - name: Install k6
+        run: |
+          set -euo pipefail
+          sudo gpg --no-default-keyring \
+            --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
+            --keyserver hkp://keyserver.ubuntu.com:80 \
+            --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" \
+            | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update -qq
+          sudo apt-get install -y k6
+
+      - name: Start hermetic stack
+        run: make up
+
+      - name: Run both engines and cross-verify
+        run: make load
+
+      # The gate only means something if it can fail. This proves it on every
+      # run, rather than trusting that a threshold typed months ago still bites.
+      - name: Prove the gate has teeth
+        run: make prove-teeth
+
+      - name: JMeter HTML report
+        if: always()
+        run: make report || true
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-evidence
+          path: |
+            reports/*.json
+            reports/*.jtl
+            reports/jmeter.log
+            reports/html
+          retention-days: 14
+
+      - name: Stack logs on failure
+        if: failure()
+        run: docker compose logs --tail 200
+
+      - name: Tear down
+        if: always()
+        run: make down

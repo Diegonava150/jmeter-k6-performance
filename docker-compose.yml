@@ -1,0 +1,52 @@
+# Hermetic performance stack. `docker compose up -d` and the whole system under
+# test exists on this machine: real Postgres, real HTTP API, real network path.
+# No public endpoint, no rate limits, no shared-tenant noise -- a reviewer who
+# clones this repo gets the same numbers you did.
+#
+# Load generators do NOT talk to the API directly. They talk to Toxiproxy, which
+# forwards to the API and can inject deterministic latency on demand. That is what
+# makes `make prove-teeth` possible: a fault we control exactly, not a fault we
+# hope shows up.
+#
+#   jmeter / k6  -->  toxiproxy :8080  -->  postgrest :3000  -->  postgres :5432
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: perfpass
+      POSTGRES_DB: perf
+    # Deliberately modest. The API pool below is smaller still, so saturation
+    # shows up as latency rather than as connection errors.
+    command: ["postgres", "-c", "max_connections=50", "-c", "shared_buffers=128MB"]
+    volumes:
+      - ./stack/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d perf"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+
+  api:
+    image: postgrest/postgrest:v12.2.3
+    environment:
+      PGRST_DB_URI: "postgres://authenticator:perfpass@db:5432/perf"
+      PGRST_DB_SCHEMA: api
+      PGRST_DB_ANON_ROLE: perf_anon
+      PGRST_DB_POOL: "8"
+      PGRST_SERVER_PORT: "3000"
+      PGRST_LOG_LEVEL: error
+    depends_on:
+      db:
+        condition: service_healthy
+
+  proxy:
+    image: ghcr.io/shopify/toxiproxy:2.11.0
+    command: ["-host=0.0.0.0", "-config=/config/toxiproxy.json"]
+    volumes:
+      - ./stack/toxiproxy.json:/config/toxiproxy.json:ro
+    ports:
+      - "8080:8080"   # system under test, as the load generators see it
+      - "8474:8474"   # toxiproxy control API, used by tools/toxic.py
+    depends_on:
+      - api

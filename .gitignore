@@ -1,0 +1,7 @@
+reports/*
+!reports/.gitkeep
+jmeter.log
+*.jtl
+.DS_Store
+__pycache__/
+*.pyc

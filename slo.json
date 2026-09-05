@@ -1,0 +1,44 @@
+{
+  "_readme": "SINGLE SOURCE OF TRUTH. Both engines derive workload shape AND pass/fail thresholds from this file. Nothing below is duplicated inside workload.jmx or workload.js: k6 reads this file directly with open() at init, and JMeter -- which cannot read JSON -- gets it via tools/gen_jmeter_props.py, which projects it into the .properties file every ${__P(...)} in the plan resolves against. Change a number here and both engines change together. Change it in only one of them and the cross-engine divergence check catches you.",
+  "service": "catalog-api",
+  "base_url": "http://localhost:8080",
+  "workload": {
+    "vus": 20,
+    "ramp_up_s": 10,
+    "duration_s": 60,
+    "think_time_ms": 300
+  },
+  "scenarios": [
+    {
+      "name": "browse_products",
+      "weight": 70,
+      "path": "/products?limit=25&order=id"
+    },
+    {
+      "name": "search_products",
+      "weight": 20,
+      "path": "/products?name=like.*widget*&order=price_cents.desc&limit=25"
+    },
+    {
+      "name": "read_orders",
+      "weight": 10,
+      "path": "/orders?limit=10&select=id,total_cents,customer_id"
+    }
+  ],
+  "slo": {
+    "p95_ms": 400,
+    "p99_ms": 900,
+    "error_rate": 0.01,
+    "min_rps": 15
+  },
+  "cross_engine": {
+    "_readme": "If JMeter and k6 measure the same service under the same workload, their numbers must land in the same neighbourhood. A wide gap does not mean the service is slow -- it means the two scripts are not the same test, and the verdict is untrustworthy no matter which way it fell.",
+    "p95_divergence_pct": 40,
+    "rps_divergence_pct": 25
+  },
+  "teeth": {
+    "_readme": "Fault injected via Toxiproxy for `make prove-teeth`. Both engines MUST report FAIL under this. An engine that still passes is not passing -- it is blind.",
+    "latency_ms": 600,
+    "jitter_ms": 150
+  }
+}

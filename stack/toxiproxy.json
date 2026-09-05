@@ -1,0 +1,8 @@
+[
+  {
+    "name": "api",
+    "listen": "0.0.0.0:8080",
+    "upstream": "api:3000",
+    "enabled": true
+  }
+]
