@@ -5,6 +5,12 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/Diegonava150/jmeter-k6-performance/actions/workflows/ci.yml">
+    <img src="https://github.com/Diegonava150/jmeter-k6-performance/actions/workflows/ci.yml/badge.svg" alt="cross-engine load" />
+  </a>
+</p>
+
+<p align="center">
   <img src="https://img.shields.io/badge/Apache%20JMeter-5.6.3-D22128?style=for-the-badge&logo=apachejmeter&logoColor=white" alt="JMeter" />
   <img src="https://img.shields.io/badge/Grafana%20k6-v2-7D64FF?style=for-the-badge&logo=k6&logoColor=white" alt="k6" />
   <img src="https://img.shields.io/badge/Toxiproxy-fault%20injection-14B8A6?style=for-the-badge&logoColor=white" alt="Toxiproxy" />
@@ -220,6 +226,11 @@ Two independent load generators, built from one config, landing 2.0% apart on
 throughput. That number is the point of the repo: it is the evidence that the
 workload each engine applied was actually the same workload, which is what makes
 the shared PASS worth anything.
+
+The same run on a GitHub-hosted runner, where nothing else is competing for the
+CPU, tightens to a **3.3% p95 gap and a 3.4% throughput gap** — and `prove-teeth`
+on that same runner put the two engines 0.3% apart at 743.0 vs 741.0 ms. The
+agreement is a property of the setup, not of one lucky laptop.
 
 The per-scenario breakdown in `reports/*.summary.json` shows the fast and slow paths
 separating exactly as the schema intends — JMeter's view of the same run:
