@@ -41,7 +41,7 @@ services:
         condition: service_healthy
 
   proxy:
-    image: ghcr.io/shopify/toxiproxy:2.11.0
+    image: ghcr.io/shopify/toxiproxy:2.12.0
     command: ["-host=0.0.0.0", "-config=/config/toxiproxy.json"]
     volumes:
       - ./stack/toxiproxy.json:/config/toxiproxy.json:ro
