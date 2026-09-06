@@ -295,7 +295,16 @@ Two details in that output are worth more than the verdict:
   nothing in the error rate, and a third of the work getting done. A gate watching
   only status codes sees a perfectly healthy service here.
 
-This runs in CI on every push. The threshold is re-proven, not trusted.
+This runs in CI on every push as **its own required status check**, not as a step
+inside the load job — and `main` is protected such that it must pass before
+anything merges.
+
+That separation is deliberate. A green *Cross-engine load* claims the service met
+its SLO today. A green *Prove the gate has teeth* claims the SLO check is still
+capable of failing at all. Those are different claims, and only the second one
+rots silently, so it does not get to hide as step seven of something else.
+
+The threshold is re-proven on every commit, not trusted.
 
 ---
 
