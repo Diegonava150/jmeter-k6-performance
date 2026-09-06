@@ -1,0 +1,43 @@
+name: Set up load engines
+description: >
+  Installs Java, JMeter and k6 at pinned versions. Both load jobs need an
+  identical toolchain -- if the two jobs ever drifted onto different engine
+  builds, the cross-engine comparison they exist to make would be meaningless.
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: "21"
+
+    - name: Install JMeter
+      shell: bash
+      run: |
+        set -euo pipefail
+        VERSION=5.6.3
+        curl -fsSL -o "$RUNNER_TEMP/jmeter.tgz" \
+          "https://archive.apache.org/dist/jmeter/binaries/apache-jmeter-${VERSION}.tgz"
+        tar xzf "$RUNNER_TEMP/jmeter.tgz" -C "$RUNNER_TEMP"
+        echo "$RUNNER_TEMP/apache-jmeter-${VERSION}/bin" >> "$GITHUB_PATH"
+
+    # Pinned tarball rather than the apt repo: the documented apt install fetches
+    # a signing key from a keyserver, and the hosted runner has no dirmngr. A
+    # pinned binary also keeps the engine version part of the committed config,
+    # since an unpinned load generator is its own source of divergence.
+    - name: Install k6
+      shell: bash
+      run: |
+        set -euo pipefail
+        VERSION=2.2.0
+        curl -fsSL -o "$RUNNER_TEMP/k6.tar.gz" \
+          "https://github.com/grafana/k6/releases/download/v${VERSION}/k6-v${VERSION}-linux-amd64.tar.gz"
+        tar xzf "$RUNNER_TEMP/k6.tar.gz" -C "$RUNNER_TEMP"
+        echo "$RUNNER_TEMP/k6-v${VERSION}-linux-amd64" >> "$GITHUB_PATH"
+
+    - name: Show engine versions
+      shell: bash
+      run: |
+        jmeter --version 2>&1 | tail -3
+        k6 version
