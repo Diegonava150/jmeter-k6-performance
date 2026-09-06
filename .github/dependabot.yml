@@ -1,10 +1,47 @@
 version: 2
+
 updates:
+  # Four separate PRs for four action bumps is noise on a repo this size, so they
+  # arrive grouped as one.
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
-      interval: weekly
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+
+  # The container versions here are not incidental dependencies -- they ARE the
+  # measurement setup. The README publishes p95, p99 and throughput baselines, and
+  # the cross-engine divergence bands in slo.json are calibrated against the
+  # numbers this exact stack produces. A silent major bump of Postgres or PostgREST
+  # moves those numbers, which means either a red build nobody can explain or, far
+  # worse, a green one measured against a service that is no longer the service the
+  # baselines describe.
+  #
+  # So majors are ignored on purpose and taken deliberately, as a re-baseline with
+  # the README updated in the same change.
+  #
+  # Minor and patch updates deliberately still come through, grouped into a single
+  # PR, because that is how security fixes arrive and suppressing them to keep the
+  # PR list quiet trades a real risk for a cosmetic one. They land in one reviewable
+  # change instead of one per image.
   - package-ecosystem: docker-compose
     directory: "/"
     schedule:
-      interval: weekly
+      interval: monthly
+    groups:
+      measurement-stack:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    ignore:
+      - dependency-name: "postgres"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "postgrest/postgrest"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "*toxiproxy*"
+        update-types: ["version-update:semver-major"]
+    commit-message:
+      prefix: "deps"
