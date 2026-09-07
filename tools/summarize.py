@@ -121,14 +121,18 @@ def parse_k6_json(path):
 # The shared reduction
 # --------------------------------------------------------------------------
 
-def summarize(samples, cfg, engine):
-    """Raw samples -> verdict. Identical arithmetic for every engine."""
-    ramp_ms = cfg["workload"]["ramp_up_s"] * 1000
-    thresholds = cfg["slo"]
+def summarize(samples, prof, engine, profile_name="closed"):
+    """Raw samples -> verdict. Identical arithmetic for every engine.
+
+    `prof` is one entry from slo.json's `profiles`, already resolved by the
+    caller, so this function never has to know which profile is "current".
+    """
+    ramp_ms = prof["ramp_up_s"] * 1000
+    thresholds = prof["slo"]
 
     if not samples:
         return {
-            "engine": engine, "verdict": "FAIL", "samples": 0,
+            "engine": engine, "profile": profile_name, "verdict": "FAIL", "samples": 0,
             "breaches": ["no samples recorded -- the run produced nothing to judge"],
         }
 
@@ -140,7 +144,8 @@ def summarize(samples, cfg, engine):
     steady = [s for s in samples if s.ts_ms >= t0 + ramp_ms]
     if not steady:
         return {
-            "engine": engine, "verdict": "FAIL", "samples": len(samples),
+            "engine": engine, "profile": profile_name, "verdict": "FAIL",
+            "samples": len(samples),
             "breaches": [f"every sample fell inside the {ramp_ms}ms ramp window"],
         }
 
@@ -152,6 +157,10 @@ def summarize(samples, cfg, engine):
     rps = (len(steady) / span_s) if span_s > 0 else 0.0
 
     m = {
+        # p50 is here for the cross-engine comparison, not for the SLO. It is the
+        # statistic that survives a transient stall on one load generator, which
+        # the tail does not.
+        "p50_ms": round(percentile(lat, 50), 2),
         "p95_ms": round(percentile(lat, 95), 2),
         "p99_ms": round(percentile(lat, 99), 2),
         "error_rate": round(failures / len(steady), 5),
@@ -165,7 +174,10 @@ def summarize(samples, cfg, engine):
         breaches.append(f"p99 {m['p99_ms']}ms > {thresholds['p99_ms']}ms")
     if m["error_rate"] > thresholds["error_rate"]:
         breaches.append(f"error rate {m['error_rate']:.3%} > {thresholds['error_rate']:.3%}")
-    if m["rps"] < thresholds["min_rps"]:
+    # Optional on purpose. A closed model's throughput is vus/(think+latency), a
+    # property of the generator, so a threshold on it there cannot fire before the
+    # latency gate does. See tools/prove_reachable.py.
+    if "min_rps" in thresholds and m["rps"] < thresholds["min_rps"]:
         breaches.append(f"throughput {m['rps']}/s < {thresholds['min_rps']}/s")
 
     by_label = {}
@@ -174,13 +186,21 @@ def summarize(samples, cfg, engine):
 
     return {
         "engine": engine,
+        "profile": profile_name,
         "verdict": "FAIL" if breaches else "PASS",
         "samples": len(steady),
         "discarded_ramp_samples": len(samples) - len(steady),
         "window_s": round(span_s, 2),
         "metrics": m,
+        # share_pct is the timing-independent fingerprint of the workload: what
+        # FRACTION of requests went to each endpoint. Two engines running the same
+        # plan must agree on this whatever the host is doing to their clocks.
         "per_scenario": {
-            k: {"samples": len(v), "p95_ms": round(percentile(sorted(v), 95), 2)}
+            k: {
+                "samples": len(v),
+                "share_pct": round(len(v) / len(steady) * 100, 2),
+                "p95_ms": round(percentile(sorted(v), 95), 2),
+            }
             for k, v in sorted(by_label.items())
         },
         "breaches": breaches,
@@ -191,11 +211,13 @@ PARSERS = {"jmeter": parse_jtl, "k6": parse_k6_json}
 
 
 def main(argv):
+    sys.path.insert(0, __import__("os").path.dirname(__file__))
+    import slo as slo_mod
+
     if "--self-test" in argv:
-        sys.path.insert(0, __import__("os").path.dirname(__file__))
-        import slo as slo_mod
         cfg = slo_mod.load()
-        ramp = cfg["workload"]["ramp_up_s"] * 1000
+        name, prof = slo_mod.profile(cfg, "closed")
+        ramp = prof["ramp_up_s"] * 1000
         base = 1_700_000_000_000
         # A synthetic run that actually spans the ramp: the first `ramp`
         # milliseconds are deliberately awful and must be trimmed away by both
@@ -204,32 +226,42 @@ def main(argv):
                for i in range(ramp // 10)]
         raw += [(base + ramp + i * 10, 100.0 + (i % 200), "browse_products", True)
                 for i in range(400)]
-        a = summarize([Sample(*r) for r in raw], cfg, "jmeter")
-        b = summarize([Sample(*r) for r in raw], cfg, "k6")
+        a = summarize([Sample(*r) for r in raw], prof, "jmeter", name)
+        b = summarize([Sample(*r) for r in raw], prof, "k6", name)
         del a["engine"], b["engine"]
         assert a == b, "summarize() is not engine-blind"
         assert a["discarded_ramp_samples"] == ramp // 10, "ramp was not trimmed"
         assert a["verdict"] == "PASS", f"expected the steady window to pass, got {a}"
+
+        # Every profile must reduce without blowing up, including the open one
+        # whose SLO carries a key the closed one does not.
+        for pname in cfg["profiles"]:
+            _, pr = slo_mod.profile(cfg, pname)
+            r = summarize([Sample(*x) for x in raw], pr, "k6", pname)
+            assert r["profile"] == pname and "metrics" in r, pname
+
         print("self-test OK")
-        print(f"  identical samples   -> identical verdict for both engines")
+        print("  identical samples   -> identical verdict for both engines")
         print(f"  ramp trimmed        -> {a['discarded_ramp_samples']} samples discarded, "
               f"{a['samples']} scored")
+        print(f"  profiles reduced    -> {', '.join(cfg['profiles'])}")
         print(f"  metrics             -> {json.dumps(a['metrics'])}")
         return 0
 
     if len(argv) < 4:
-        print("usage: summarize.py <jmeter|k6> <raw-file> <out.json>", file=sys.stderr)
+        print("usage: summarize.py <jmeter|k6> <raw-file> <out.json> [profile]",
+              file=sys.stderr)
         return 2
     engine, raw_path, out_path = argv[1], argv[2], argv[3]
-    sys.path.insert(0, __import__("os").path.dirname(__file__))
-    import slo as slo_mod
+    cfg = slo_mod.load()
+    name, prof = slo_mod.profile(cfg, argv[4] if len(argv) > 4 else None)
 
     samples = PARSERS[engine](raw_path)
-    result = summarize(samples, slo_mod.load(), engine)
+    result = summarize(samples, prof, engine, name)
     with open(out_path, "w") as fh:
         json.dump(result, fh, indent=2)
 
-    print(f"[{engine}] {result['verdict']}  "
+    print(f"[{engine}/{name}] {result['verdict']}  "
           f"samples={result['samples']}  "
           f"p95={result.get('metrics', {}).get('p95_ms', '-')}ms  "
           f"rps={result.get('metrics', {}).get('rps', '-')}")

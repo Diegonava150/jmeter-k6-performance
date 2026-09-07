@@ -48,8 +48,11 @@ jobs:
       - name: Start hermetic stack
         run: make up
 
-      - name: Run both engines and cross-verify
+      - name: Closed profile -- both engines and cross-verify
         run: make load
+
+      - name: Open profile -- fixed arrival rate, service can saturate
+        run: make load-open
 
       - name: JMeter HTML report
         if: always()
@@ -81,7 +84,7 @@ jobs:
   # claims and the second is the one that rots silently, so it gets its own line
   # in the checks list.
   teeth:
-    name: Prove the gate has teeth
+    name: Prove the gates can fail
     runs-on: ubuntu-latest
     timeout-minutes: 25
     needs: unit
@@ -97,6 +100,14 @@ jobs:
 
       - name: Inject a real fault and require both engines to catch it
         run: make prove-teeth
+
+      # The sibling proof, aimed at the check this repo is actually about.
+      # prove-teeth shows the SLO thresholds can fail; this shows the divergence
+      # bands can. The engines are run at deliberately different loads against a
+      # healthy service, and the gate is required to reject the run even though
+      # both engines are comfortably inside the SLO.
+      - name: Desynchronise the engines and require the gate to catch that
+        run: make prove-divergence
 
       - name: Upload evidence
         if: always()

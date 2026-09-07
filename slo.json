@@ -2,12 +2,6 @@
   "_readme": "SINGLE SOURCE OF TRUTH. Both engines derive workload shape AND pass/fail thresholds from this file. Nothing below is duplicated inside workload.jmx or workload.js: k6 reads this file directly with open() at init, and JMeter -- which cannot read JSON -- gets it via tools/gen_jmeter_props.py, which projects it into the .properties file every ${__P(...)} in the plan resolves against. Change a number here and both engines change together. Change it in only one of them and the cross-engine divergence check catches you.",
   "service": "catalog-api",
   "base_url": "http://localhost:8080",
-  "workload": {
-    "vus": 20,
-    "ramp_up_s": 10,
-    "duration_s": 60,
-    "think_time_ms": 300
-  },
   "scenarios": [
     {
       "name": "browse_products",
@@ -25,20 +19,48 @@
       "path": "/orders?limit=10&select=id,total_cents,customer_id"
     }
   ],
-  "slo": {
-    "p95_ms": 400,
-    "p99_ms": 900,
-    "error_rate": 0.01,
-    "min_rps": 15
+  "profiles": {
+    "closed": {
+      "model": "closed",
+      "_readme": "Fixed concurrency with think time. Every VU waits for its own response before sending the next request, so when the service slows the LOAD BACKS OFF. That makes this profile good at measuring latency under a known, self-limiting arrival pattern, and structurally incapable of showing a queue build. Note there is no min_rps here: in a closed model throughput is VUs/(think+latency), a property of the generator, so any throughput threshold is arithmetically dominated by the latency threshold. See tools/prove_reachable.py.",
+      "vus": 20,
+      "ramp_up_s": 10,
+      "duration_s": 60,
+      "think_time_ms": 300,
+      "slo": {
+        "p95_ms": 400,
+        "p99_ms": 900,
+        "error_rate": 0.01
+      }
+    },
+    "open": {
+      "model": "open",
+      "_readme": "Fixed ARRIVAL RATE. Requests are offered on a schedule regardless of whether earlier ones have come back, so a slow service accumulates a real queue instead of quietly receiving less work. That makes throughput an independent signal. max_vus is how much concurrency the client fleet can bring, and it is chosen deliberately: by Little's Law the fleet sustains rate_per_s only while rate_per_s * latency <= max_vus, so at 60 VUs it keeps up to ~300ms and starts shedding after that -- BEFORE p95 crosses 400ms. Throughput is therefore a leading indicator here rather than a lagging restatement of the latency gate, which is exactly what tools/prove_reachable.py enforces.",
+      "rate_per_s": 200,
+      "max_vus": 60,
+      "ramp_up_s": 10,
+      "duration_s": 60,
+      "think_time_ms": 0,
+      "slo": {
+        "p95_ms": 400,
+        "p99_ms": 900,
+        "error_rate": 0.01,
+        "min_rps": 180
+      }
+    }
   },
   "cross_engine": {
-    "_readme": "If JMeter and k6 measure the same service under the same workload, their numbers must land in the same neighbourhood. A wide gap does not mean the service is slow -- it means the two scripts are not the same test, and the verdict is untrustworthy no matter which way it fell.",
-    "p95_divergence_pct": 40,
-    "rps_divergence_pct": 25
+    "_readme": "What this check asks is narrow: did the two engines apply the SAME WORKLOAD? It deliberately does not ask how fast the service was -- that is the SLO's job. It is scored on THROUGHPUT and SCENARIO MIX, and not on latency at any percentile, because latency was measured and does not discriminate. Across four runs (closed honest, open honest, faulted, and a deliberate 2x desync) the median gap on honest runs ranged 6.0%-46.0% while the desync scored 63.8% -- no separation, because at a 2-6ms median JMeter's whole-millisecond quantisation is already tens of percent. Over the same four runs throughput scored 0.0%-2.9% honest against 49.5% for the desync: clean separation by more than an order of magnitude. Scenario mix is the second signal because throughput alone is blind in the open profile, where both engines are pinned to the same arrival rate by construction and only the MIX of endpoints could differ. Latency is still printed side by side, because a gap there is worth a human's attention even when it is not worth a red build.",
+    "rps_divergence_pct": 10,
+    "scenario_mix_divergence_pp": 5
   },
   "teeth": {
-    "_readme": "Fault injected via Toxiproxy for `make prove-teeth`. Both engines MUST report FAIL under this. An engine that still passes is not passing -- it is blind.",
+    "_readme": "Fault injected via Toxiproxy for `make prove-teeth`. Both engines MUST report FAIL under this. An engine that still passes is not passing, it is blind.",
     "latency_ms": 600,
     "jitter_ms": 150
+  },
+  "divergence_probe": {
+    "_readme": "Used by `make prove-divergence`. k6 runs with its load multiplied by this factor while JMeter runs as configured, so the two engines are provably NOT running the same workload. cross_verify.py must reject the run on the divergence bands alone -- both engines may well still be inside the SLO, and that is the point: a green build assembled from two incomparable runs is worth less than a red one.",
+    "load_multiplier": 2.0
   }
 }

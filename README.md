@@ -88,10 +88,13 @@ And the system under test, entirely local:
 Prerequisites: **Docker**, **Java 21**, **JMeter 5.6+**, **k6**, **Python 3.11+**.
 
 ```bash
-make test          # no Docker needed: summarizer + gate unit tests
-make up            # start Postgres + PostgREST + Toxiproxy, wait for readiness
-make load          # run BOTH engines, then cross-verify
-make prove-teeth   # inject latency, assert BOTH engines catch it
+make test              # no Docker: summarizer, gate, and threshold-reachability checks
+make up                # start Postgres + PostgREST + Toxiproxy, wait for readiness
+make load              # closed profile: both engines, then cross-verify
+make load-open         # open profile: fixed arrival rate, service can saturate
+make load-all          # both profiles
+make prove-teeth       # inject latency, assert BOTH engines catch it
+make prove-divergence  # desync the engines, assert the GATE catches that
 make down
 ```
 
@@ -144,18 +147,42 @@ the shared summarizer, *that disagreement is itself information*.
 
 ### 3. Disagreement is a failure, not a footnote
 
-`tools/cross_verify.py` checks agreement **before** it checks the SLO, and it checks
-agreement even in fault-injection mode:
+`tools/cross_verify.py` checks agreement **before** it checks the SLO, and it
+checks agreement even in fault-injection mode. It asks one narrow question — *did
+the two engines apply the same workload?* — and it is deliberately **not** scored
+on latency.
 
-- **Verdict agreement.** JMeter says PASS and k6 says FAIL → build fails. You do
-  not get to pick the answer you like.
-- **Divergence bands.** If the two engines were pointed at the same service under
-  the same workload and their p95s land more than `p95_divergence_pct` apart, one
-  of them is lying and the run is void — *regardless of which way it fell*. A green
-  build built on two tests that are not the same test is the thing this repo exists
-  to prevent.
+That last part was a correction, not a design choice. The check originally gated
+on p95 divergence. Then four runs were measured — an honest closed run, an honest
+open run, a faulted run, and a deliberate 2x desync:
 
-A wide gap is not a slow service. It is a broken test. Broken tests fail the build.
+| run | median gap | **throughput gap** |
+|---|---|---|
+| closed, honest | 46.0% | **1.2%** |
+| open, honest | 6.0% | **0.0%** |
+| faulted (600ms injected) | 1.5% | **2.9%** |
+| **closed, deliberate 2x desync** | **63.8%** | **49.5%** |
+
+Latency does not separate an honest run from a sabotaged one — an honest run
+scored 46% and the sabotage scored 63.8%. At a 2–6ms median, JMeter's
+whole-millisecond quantisation is already tens of percent, so the number is mostly
+rounding. Throughput separates by more than an order of magnitude.
+
+So the gate scores two things:
+
+- **Throughput.** How much work was actually offered. 0.0–2.9% on every honest
+  run, 49.5% on the desync.
+- **Scenario mix.** *Which* work was offered — the share of traffic each endpoint
+  received, compared in percentage points. This exists because throughput is
+  blind in the open profile, where both engines are pinned to the same arrival
+  rate by construction and the only thing that could drift is the endpoint mix.
+
+Latency is still printed side by side, because a gap there deserves a human's
+attention even when it does not deserve a red build.
+
+The alternative was widening the latency band until it stopped complaining. This
+README says elsewhere that a band you keep widening is not a band; the same logic
+says a signal that cannot tell sabotage from noise should be removed, not tuned.
 
 ---
 
@@ -200,51 +227,115 @@ worth less than a red one. This needs no Docker and runs first in CI.
 
 ## What a clean run looks like
 
-Measured on this repo's own stack (20 VUs, 60s steady window, 400k products):
+Two workload profiles ship. `make load` runs the closed model, `make load-open`
+the open one, `make load-all` both.
 
 ```
-$ make load
-[jmeter] PASS  samples=3801  p95=37.0ms   rps=63.9
-[k6]     PASS  samples=4067  p95=30.68ms  rps=62.6
+$ make load-open
 --------------------------------------------------------------------------
-  CROSS-ENGINE VERIFY   service=catalog-api
+  CROSS-ENGINE VERIFY   service=catalog-api   profile=open
 --------------------------------------------------------------------------
-  samples        jmeter=      3801     k6=      4067     gap=   6.5%
-  p95            jmeter=      37.0ms   k6=     30.68ms   gap=  17.1%
-  p99            jmeter=      45.0ms   k6=     38.38ms   gap=  14.7%
-  throughput     jmeter=      63.9/s   k6=      62.6/s   gap=   2.0%
+  samples        jmeter=     11971     k6=     12001     gap=   0.2%
+  p50            jmeter=       2.0ms   k6=      1.88ms   gap=   6.0%
+  p95            jmeter=      18.0ms   k6=     17.82ms   gap=   1.0%
+  p99            jmeter=      21.0ms   k6=     21.96ms   gap=   4.4%
+  rps  [gated]   jmeter=    200.08/s   k6=    200.04/s   gap=   0.0%
   error rate     jmeter=       0.0     k6=       0.0     gap=   0.0%
+
+  scenario mix  [gated]
+    browse_products      jmeter=  70.0%  k6=  70.5%  diff=  0.5pp
+    read_orders          jmeter=  10.0%  k6=   9.7%  diff=  0.3pp
+    search_products      jmeter=  20.0%  k6=  19.9%  diff=  0.1pp
+
+  RESULT: PASS -- both engines agree, both inside SLO (rps gap 0.0%, worst mix gap 0.5pp).
+--------------------------------------------------------------------------
+```
+
+Two independent load generators, built from one config, landing **0.0% apart on
+throughput and 0.5pp apart on traffic mix**. Those numbers are the point of the
+repo: they are the evidence that the workload each engine applied was actually the
+same workload, which is what makes the shared PASS worth anything.
+
+### Two profiles, because one of them cannot see saturation
+
+| | `closed` | `open` |
+|---|---|---|
+| what is held fixed | 20 VUs + 300ms think time | 200 req/s arrival rate |
+| when the service slows | **load backs off** | **a queue builds** |
+| throughput is | a property of the generator | a property of the service |
+| can show saturation | no | yes |
+
+The closed profile is the familiar one and it has a structural blind spot: every
+VU waits for its own response before sending again, so a slower service simply
+receives less work. It can never show a queue forming. That is also why it
+declares no `min_rps` — see below.
+
+The open profile offers requests on a schedule regardless of whether earlier ones
+came back, capped at `max_vus: 60`. By Little's Law the fleet sustains 200/s only
+while `200 × latency ≤ 60`, so it keeps up to ~300ms and sheds after that —
+*before* p95 crosses 400ms. Throughput becomes a leading indicator rather than a
+restatement of the latency gate.
+
+### A threshold that could not fire
+
+This repo shipped one, and `tools/prove_reachable.py` exists because of it.
+
+The closed profile originally carried `min_rps: 15` next to `p95_ms: 400`. In a
+closed model throughput is `vus / (think + latency)` — a property of the *load
+generator*:
+
+| condition | latency | throughput |
+|---|---|---|
+| clean run | 37ms | 59.3/s |
+| at the p95 threshold | 400ms | 28.6/s |
+| under the 600ms injected fault | 744ms | 19.2/s |
+| **`min_rps: 15` needs** | **>1033ms** | <15/s |
+
+p95 fails at 400ms. Throughput could not breach until 1033ms — p95 had already
+failed by **2.6×**. It never fired in any run, including under fault, and it never
+could have. `make prove-teeth` did not catch it, because proving the verdict can
+flip says nothing about whether each individual threshold is reachable.
+
+`prove_reachable.py` now walks latency upward for every profile and fails the build
+if any threshold is dominated by another. It runs in `make test` — no Docker, no
+load generator, milliseconds — and it keeps the config that shipped the bug as a
+regression fixture:
+
+```
+$ make test
+>> reachability self-test
+self-test OK
+  the config this repo shipped is correctly rejected:
+    profile 'historical': min_rps=15/s is dominated by p95=400ms. Throughput cannot
+    breach until latency reaches 1034ms, by which point p95 has already failed by
+    2.6x. The threshold cannot fire on its own and is decoration.
+```
+
+---
+
+## `make prove-divergence` — proving the *other* gate can fail
+
+`prove-teeth` proves the SLO thresholds bite. It says nothing about the divergence
+bands, which are the part that decides whether a green run is trustworthy at all.
+
+So: run JMeter as configured and k6 at **2× the load**, against a perfectly healthy
+service. Both engines comfortably pass their own SLO — that is the whole point. A
+build that only checked thresholds would wave this through.
+
+```
+$ make prove-divergence
+  rps  [gated]   jmeter=     63.66/s   k6=    125.75/s   gap=  49.4%
 
   jmeter verdict: PASS
   k6 verdict: PASS
 
-  RESULT: PASS -- both engines agree, both inside SLO (p95 gap 17.1%, rps gap 2.0%).
---------------------------------------------------------------------------
+  RESULT: PASS -- the gate rejected a desynchronised run:
+    - throughput divergence 49.4% exceeds the 10% band (63.66/s vs 125.75/s)
 ```
 
-Two independent load generators, built from one config, landing 2.0% apart on
-throughput. That number is the point of the repo: it is the evidence that the
-workload each engine applied was actually the same workload, which is what makes
-the shared PASS worth anything.
-
-The same run on a GitHub-hosted runner, where nothing else is competing for the
-CPU, tightens to a **3.3% p95 gap and a 3.4% throughput gap** — and `prove-teeth`
-on that same runner put the two engines 0.3% apart at 743.0 vs 741.0 ms. The
-agreement is a property of the setup, not of one lucky laptop.
-
-The per-scenario breakdown in `reports/*.summary.json` shows the fast and slow paths
-separating exactly as the schema intends — JMeter's view of the same run:
-
-| scenario | share of traffic | p95 |
-|---|---|---|
-| `browse_products` | 70.0% (2661) | 12.0 ms |
-| `search_products` | 20.0% (760) | 43.0 ms |
-| `read_orders` | 10.0% (380) | 13.0 ms |
-
-The traffic mix lands on 70.0 / 20.0 / 10.0 against the weights declared in
-`slo.json`, which is itself a check: JMeter's throughput controllers and k6's
-cumulative-weight roll are two completely different mechanisms that have to produce
-the same distribution, or the workloads were never comparable.
+Both engines green, build correctly red. If the bands had *not* noticed, that is
+reported as a failure of its own — a divergence check too loose to detect a
+deliberate 2× desync is decoration, and the target says so in those words.
 
 ---
 
@@ -295,7 +386,7 @@ Two details in that output are worth more than the verdict:
   nothing in the error rate, and a third of the work getting done. A gate watching
   only status codes sees a perfectly healthy service here.
 
-This runs in CI on every push as **its own required status check**, not as a step
+This runs in CI on every push as part of a **required status check**, not as a step
 inside the load job — and `main` is protected such that it must pass before
 anything merges.
 
@@ -331,18 +422,19 @@ measures nothing interesting.
 ## Layout
 
 ```
-slo.json                    single source of truth: workload, thresholds, bands
+slo.json                    single source of truth: profiles, thresholds, bands
 docker-compose.yml          postgres + postgrest + toxiproxy
 Makefile                    up / load / prove-teeth / report / down
 
-jmeter/workload.jmx         plan shape only; every value is ${__P(...)}
+jmeter/workload.jmx         plan shape only; every value is ${__P(...)}; both models
 jmeter/user.properties      lean .jtl output (no response bodies during measurement)
-k6/workload.js              reads slo.json via open(); no literals
+k6/workload.js              reads slo.json via open(); both models; no literals
 
-tools/slo.py                config loader + weight bands
+tools/slo.py                config loader, profile resolution, weight bands
 tools/gen_jmeter_props.py   slo.json  ->  JMeter .properties
 tools/summarize.py          THE shared reduction, + --self-test
 tools/cross_verify.py       THE gate: SLO + agreement + divergence
+tools/prove_reachable.py    fails the build on a threshold that cannot fire
 tools/test_gate.py          tests that the gate REJECTS what it claims to reject
 tools/toxic.py              Toxiproxy fault injection (stdlib only)
 tools/wait_for_stack.py     readiness by real response, not by open port
@@ -373,28 +465,26 @@ that nobody notices it did.
 first request. Scoring the ramp punishes an engine for how it warms up rather than
 for what the service did.
 
-**Why is p99 not in the divergence band?** Because it is not a stable enough signal
-to gate on, and three runs of this repo show it:
+**Why is no latency percentile in the divergence band?** Because latency was
+measured against a known-sabotaged run and could not tell it from an honest one.
+The table under *Disagreement is a failure* has the numbers. The underlying reason
+is that JMeter stores whole-millisecond elapsed times and k6 keeps sub-millisecond
+floats, so the gap is a fixed absolute error whose *percentage* swings with
+wherever the statistic happens to land — 39.5%, 14.7% and 1.9% on three p99
+samples across otherwise comparable runs. Throughput and scenario mix have no such
+sensitivity.
 
-| run | p99 (jmeter / k6) | **p99 gap** | p95 gap | rps gap |
-|---|---|---|---|---|
-| 50k-row dataset, ~15ms tail | 30.0 / 18.16 ms | **39.5%** | 6.0% | 2.7% |
-| 400k-row dataset | 45.0 / 38.38 ms | **14.7%** | 17.1% | 2.0% |
-| 400k-row dataset, *identical config* | 86.0 / 84.33 ms | **1.9%** | 17.7% | 2.0% |
+**Why gate the open profile on throughput at all, if both engines are pinned to
+the same arrival rate?** Because they are only pinned while the service keeps up.
+`max_vus` is set to 60 deliberately: by Little's Law the fleet sustains 200/s only
+while `200 * latency <= 60`, so it holds up to ~300ms and starts shedding after
+that — *before* p95 crosses 400ms. Throughput is a leading indicator in that
+profile rather than a lagging restatement of the latency gate, which is exactly
+what `tools/prove_reachable.py` enforces.
 
-JMeter records elapsed time as whole milliseconds; k6 keeps sub-millisecond floats.
-That quantisation is a fixed absolute error, so how large it *looks* depends
-entirely on how far out the tail happens to land — and the last two rows are the
-same code, same dataset, same `slo.json`, on consecutive runs. The engines did not
-become more alike between them; the denominator moved.
-
-A signal that swings from 39.5% to 1.9% while the thing it is supposed to detect
-never changes is not measuring whether the two workloads match, which is the only
-job the divergence check has. p95 and throughput stay put across all three runs, so
-those gate the build. p99 is still evaluated against the SLO by each engine
-independently and still printed side by side — it just is not treated as evidence
-that the workloads differ. A band you have to keep widening to stay green is not a
-band.
+**Why does `make prove-teeth` run only the closed profile?** The injected fault is
+600ms of latency, which trips the SLO in either model. Running both would double
+the runtime to demonstrate the same thing twice.
 
 ---
 
