@@ -28,7 +28,7 @@ services:
       retries: 40
 
   api:
-    image: postgrest/postgrest:v12.2.3
+    image: postgrest/postgrest:v12.2.12
     environment:
       PGRST_DB_URI: "postgres://authenticator:perfpass@db:5432/perf"
       PGRST_DB_SCHEMA: api
@@ -41,7 +41,7 @@ services:
         condition: service_healthy
 
   proxy:
-    image: ghcr.io/shopify/toxiproxy:2.11.0
+    image: ghcr.io/shopify/toxiproxy:2.12.0
     command: ["-host=0.0.0.0", "-config=/config/toxiproxy.json"]
     volumes:
       - ./stack/toxiproxy.json:/config/toxiproxy.json:ro
